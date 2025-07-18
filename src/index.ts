@@ -5,8 +5,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Client, GatewayIntentBits, TextChannel } from 'discord.js';
+import { Client, Collection, GatewayIntentBits, Message, Snowflake, TextChannel } from 'discord.js';
 import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 
 // Load environment variables
 dotenv.config();
@@ -91,6 +92,53 @@ async function findChannel(channelIdentifier: string, guildIdentifier?: string):
   throw new Error(`Channel "${channelIdentifier}" is not a text channel or not found in server "${guild.name}"`);
 }
 
+async function getMessagesInTimePeriod(channel: TextChannel, startTime: string, endTime: string, limit: number) : Promise<Collection<Snowflake, Message>> {
+  const startTimeDate = startTime ? new Date(startTime).getTime() : 0;
+  const endTimeDate = new Date(endTime).getTime();
+  const messages: Collection<Snowflake, Message> = new Collection()
+  let lastMessageId: Snowflake | undefined
+
+  while (true) {
+      console.error(`Fetching messages before Snowflake: ${lastMessageId || 'START'}`);
+      
+      const fetchedMessages: Collection<Snowflake, Message> = await channel.messages.fetch({
+          limit: limit,
+          before: lastMessageId
+      })
+      console.log(`Fetched ${fetchedMessages.size}`);
+
+      if (fetchedMessages.size === 0) {
+          break
+      }
+
+      for (const [sf, message] of fetchedMessages) {
+          if (message.createdTimestamp >= startTimeDate && message.createdTimestamp <= endTimeDate) {
+              messages.set(sf, message)
+          } else if (message.createdTimestamp < startTimeDate) {
+              return messages
+          }
+      }
+
+      lastMessageId = fetchedMessages.last()?.id
+  }
+
+  return messages
+}
+
+function zodSchemaToJsonSchema(zodSchema: z.ZodSchema) {
+  const jsonSchema = zodToJsonSchema(zodSchema, {
+    target: 'openApi3',
+    $refStrategy: 'relative',
+  });
+  
+  // not needed for MCP
+  if (jsonSchema.$schema) {
+    delete jsonSchema.$schema;
+  }
+  
+  return jsonSchema;
+}
+
 // Updated validation schemas
 const SendMessageSchema = z.object({
   server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
@@ -101,7 +149,9 @@ const SendMessageSchema = z.object({
 const ReadMessagesSchema = z.object({
   server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
   channel: z.string().describe('Channel name (e.g., "general") or ID'),
-  limit: z.number().min(1).max(100).default(50),
+  limit: z.number().min(1).max(100).default(50).describe('Number of messages to fetch (max 100). Either use limit OR startDate/endDate'),
+  startDate: z.string().optional().describe('Start date in ISO format (e.g., "2025-01-01T00:00:00.000Z"). If provided, fetches all messages from now back to this date (limit is ignored)'),
+  endDate: z.string().default(() => new Date().toISOString()).describe('End date in ISO format (e.g., "2025-01-01T00:00:00.000Z"). If provided with startDate, fetches messages between startDate and endDate'),
 });
 
 // Create server instance
@@ -124,47 +174,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "send-message",
         description: "Send a message to a Discord channel",
-        inputSchema: {
-          type: "object",
-          properties: {
-            server: {
-              type: "string",
-              description: 'Server name or ID (optional if bot is only in one server)',
-            },
-            channel: {
-              type: "string",
-              description: 'Channel name (e.g., "general") or ID',
-            },
-            message: {
-              type: "string",
-              description: "Message content to send",
-            },
-          },
-          required: ["channel", "message"],
-        },
+        inputSchema: zodSchemaToJsonSchema(SendMessageSchema),
       },
       {
         name: "read-messages",
         description: "Read recent messages from a Discord channel",
-        inputSchema: {
-          type: "object",
-          properties: {
-            server: {
-              type: "string",
-              description: 'Server name or ID (optional if bot is only in one server)',
-            },
-            channel: {
-              type: "string",
-              description: 'Channel name (e.g., "general") or ID',
-            },
-            limit: {
-              type: "number",
-              description: "Number of messages to fetch (max 100)",
-              default: 50,
-            },
-          },
-          required: ["channel"],
-        },
+        inputSchema: zodSchemaToJsonSchema(ReadMessagesSchema),
       },
     ],
   };
@@ -190,10 +205,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "read-messages": {
-        const { channel: channelIdentifier, limit } = ReadMessagesSchema.parse(args);
+        const { channel: channelIdentifier, limit, startDate, endDate } = ReadMessagesSchema.parse(args);
         const channel = await findChannel(channelIdentifier);
         
-        const messages = await channel.messages.fetch({ limit });
+        let messages: Collection<Snowflake, Message>
+        if (startDate) {
+          messages = await getMessagesInTimePeriod(channel, startDate, endDate, 100);
+        } else {
+          messages = await channel.messages.fetch({ limit });
+        }
         const formattedMessages = Array.from(messages.values()).map(msg => ({
           channel: `#${channel.name}`,
           server: channel.guild.name,
